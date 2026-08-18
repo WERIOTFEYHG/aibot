@@ -1,11 +1,15 @@
+"""
+ربات تلگرامی هوش مصنوعی با Google Gemini
+"""
+
 import os
 import io
 import re
 import logging
 import asyncio
+import time
 from typing import Optional
 from collections import defaultdict
-import time
 
 from telegram import Update
 from telegram.ext import (
@@ -30,7 +34,7 @@ MAX_RETRIES = 3
 client = genai.Client(api_key=GEMINI_API_KEY)
 chat_config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
 
-# ---------- لاگ با فیلتر توکن ----------
+# ---------- لاگ ----------
 class TokenFilter(logging.Filter):
     def filter(self, record):
         record.msg = re.sub(
@@ -47,7 +51,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.addFilter(TokenFilter())
 
-# ---------- حافظه و مدیریت ----------
+# ---------- حافظه ----------
 user_sessions: dict[int, "genai.chats.Chat"] = {}
 user_last_message: dict[int, float] = {}
 
@@ -70,7 +74,7 @@ def trim_history(chat_id: int):
             model=MODEL_NAME, config=chat_config, history=trimmed
         )
 
-# ---------- Retry برای 429 ----------
+# ---------- Retry ----------
 async def send_with_retry(session, message, max_retries=MAX_RETRIES) -> Optional[str]:
     for attempt in range(max_retries):
         try:
@@ -78,16 +82,16 @@ async def send_with_retry(session, message, max_retries=MAX_RETRIES) -> Optional
             return response.text
         except Exception as e:
             error_str = str(e)
-            if "429" in error_str and "retryDelay" in error_str:
+            if "429" in error_str:
                 import re
                 match = re.search(r'retryDelay":\s*"(\d+)s', error_str)
                 wait_time = int(match.group(1)) if match else (2 ** attempt)
                 logger.warning(f"Rate limit, waiting {wait_time}s...")
                 await asyncio.sleep(wait_time)
                 continue
-            elif "429" in error_str:
+            elif "RESOURCE_EXHAUSTED" in error_str:
                 wait_time = 2 ** attempt
-                logger.warning(f"Rate limit (no delay), waiting {wait_time}s...")
+                logger.warning(f"Quota exceeded, waiting {wait_time}s...")
                 await asyncio.sleep(wait_time)
                 continue
             else:
@@ -109,7 +113,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_sessions[chat_id] = new_chat()
     await update.message.reply_text("حافظه‌ی مکالمه پاک شد. ✅")
 
-# ---------- پیام‌های متنی ----------
+# ---------- پیام‌ها ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     
@@ -137,7 +141,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer)
 
-# ---------- پیام‌های عکس ----------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     
@@ -154,9 +157,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = bytes(await tg_file.download_as_bytearray())
         image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
         
-        caption = update.message.caption
-        if not caption:
-            caption = "این عکس رو توضیح بده."
+        caption = update.message.caption or "این عکس رو توضیح بده."
 
         session = get_session(chat_id)
         answer = await send_with_retry(session, [caption, image_part])
@@ -179,9 +180,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ خطایی رخ داد. لطفاً دوباره تلاش کن."
         )
 
-# ---------- اجرای ربات ----------
-async def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+# ---------- اجرای اصلی (رفع باگ Event Loop) ----------
+def main():
+    """اجرای ربات با روش صحیح"""
+    app = ApplicationBuilder() \
+        .token(TELEGRAM_BOT_TOKEN) \
+        .build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
@@ -189,12 +193,18 @@ async def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_error_handler(error_handler)
     
-    # حذف webhook برای جلوگیری از Conflict
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    
     logger.info("ربات در حال اجراست...")
-    await app.run_polling()
+    
+    # حذف webhook برای جلوگیری از Conflict
+    app.bot.delete_webhook(drop_pending_updates=True)
+    
+    # اجرای polling (همزمان - بدون asyncio.run)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+        poll_interval=0.5,
+        bootstrap_retries=-1
+    )
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
